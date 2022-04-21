@@ -13,27 +13,21 @@ OBJCOPY:toolchain-clang = "${HOST_PREFIX}llvm-objcopy"
 STRIP:toolchain-clang = "${HOST_PREFIX}llvm-strip"
 STRINGS:toolchain-clang = "${HOST_PREFIX}llvm-strings"
 READELF:toolchain-clang = "${HOST_PREFIX}llvm-readelf"
-# see https://github.com/llvm/llvm-project/issues/53996
-OBJDUMP:mips:toolchain-clang = "${HOST_PREFIX}objdump"
-OBJDUMP:mipsel:toolchain-clang = "${HOST_PREFIX}objdump"
 
 LTO:toolchain-clang = "${@bb.utils.contains('DISTRO_FEATURES', 'thin-lto', '-flto=thin', '-flto -fuse-ld=lld', d)}"
 PACKAGE_DEBUG_SPLIT_STYLE:toolchain-clang = "debug-without-src"
 
 COMPILER_RT ??= ""
 COMPILER_RT:class-native = "-rtlib=libgcc ${UNWINDLIB}"
-COMPILER_RT:powerpc = "-rtlib=libgcc ${UNWINDLIB}"
 COMPILER_RT:armeb = "-rtlib=libgcc ${UNWINDLIB}"
 COMPILER_RT:libc-klibc = "-rtlib=libgcc ${UNWINDLIB}"
 
 UNWINDLIB ??= ""
 UNWINDLIB:class-native = "--unwindlib=libgcc"
-UNWINDLIB:powerpc = "--unwindlib=libgcc"
 UNWINDLIB:armeb = "--unwindlib=libgcc"
 UNWINDLIB_libc-klibc = "--unwindlib=libgcc"
 
 LIBCPLUSPLUS ??= ""
-LIBCPLUSPLUS:powerpc = "-stdlib=libstdc++"
 LIBCPLUSPLUS:armv5 = "-stdlib=libstdc++"
 
 CXXFLAGS:append:toolchain-clang = " ${LIBCPLUSPLUS}"
@@ -42,6 +36,10 @@ LDFLAGS:append:toolchain-clang = " ${COMPILER_RT} ${LIBCPLUSPLUS}"
 TUNE_CCARGS:remove:toolchain-clang = "-meb"
 TUNE_CCARGS:remove:toolchain-clang = "-mel"
 TUNE_CCARGS:append:toolchain-clang = "${@bb.utils.contains("TUNE_FEATURES", "bigendian", " -mbig-endian", " -mlittle-endian", d)}"
+# Qemu uses 7400 but fails to emulate VSX/altivec instrs e.g. xor and fails with illegal instructions especially on musl/strspn.c
+# Workaround the qemu limitation by disable altivec in code generation, gcc does not use altivec, so code generated with clang is
+# superior but sadly qemu starts to puke :(, maybe it will work ok on real hardware !!
+TUNE_CCARGS:append:toolchain-clang = "${@bb.utils.contains("TUNE_FEATURES", "ppc7400", " -mno-altivec", "", d)}"
 
 # Clang does not yet support big.LITTLE performance tunes, so use the LITTLE for tunes
 TUNE_CCARGS:remove:toolchain-clang = "-mcpu=cortex-a57.cortex-a53 -mcpu=cortex-a72.cortex-a53 -mcpu=cortex-a15.cortex-a7 -mcpu=cortex-a17.cortex-a7 -mcpu=cortex-a72.cortex-a35 -mcpu=cortex-a73.cortex-a53 -mcpu=cortex-a75.cortex-a55 -mcpu=cortex-a76.cortex-a55"
@@ -57,14 +55,15 @@ TUNE_CCARGS:remove:toolchain-clang = "-mcpu=octeontx2"
 TUNE_CCARGS:append:toolchain-clang:riscv32 = " -mno-relax"
 TUNE_CCARGS:append:toolchain-clang:riscv64 = " -mno-relax"
 
-TUNE_CCARGS:remove:toolchain-clang:powerpc = "-mhard-float"
-TUNE_CCARGS:remove:toolchain-clang:powerpc = "-mno-spe"
-
-TUNE_CCARGS:append:toolchain-clang = " -Qunused-arguments"
+# Reconcile some ppc anamolies
+TUNE_CCARGS:remove:toolchain-clang:powerpc = "-mhard-float -mno-spe"
 TUNE_CCARGS:append:toolchain-clang:libc-musl:powerpc64 = " -mlong-double-64"
 TUNE_CCARGS:append:toolchain-clang:libc-musl:powerpc64le = " -mlong-double-64"
+TUNE_CCARGS:append:toolchain-clang:libc-musl:powerpc = " -mlong-double-64"
 # usrmerge workaround
 TUNE_CCARGS:append:toolchain-clang = "${@bb.utils.contains("DISTRO_FEATURES", "usrmerge", " --dyld-prefix=/usr", "", d)}"
+
+TUNE_CCARGS:append:toolchain-clang = " -Qunused-arguments"
 
 LDFLAGS:append:toolchain-clang:class-nativesdk:x86-64 = " -Wl,-dynamic-linker,${base_libdir}/ld-linux-x86-64.so.2"
 LDFLAGS:append:toolchain-clang:class-nativesdk:x86 = " -Wl,-dynamic-linker,${base_libdir}/ld-linux.so.2"
@@ -84,7 +83,6 @@ RUNTIME ??= "gnu"
 #RUNTIME:toolchain-gcc = "gnu"
 RUNTIME:armeb = "gnu"
 RUNTIME:armv5 = "gnu"
-RUNTIME:powerpc = "gnu"
 
 TOOLCHAIN:class-native = "gcc"
 TOOLCHAIN:class-nativesdk = "gcc"
@@ -96,18 +94,25 @@ OVERRIDES =. "${@['', 'toolchain-${TOOLCHAIN}:']['${TOOLCHAIN}' != '']}"
 OVERRIDES =. "${@['', 'runtime-${RUNTIME}:']['${RUNTIME}' != '']}"
 OVERRIDES[vardepsexclude] += "TOOLCHAIN RUNTIME"
 
+
+YOCTO_ALTERNATE_EXE_PATH:toolchain-clang:class-target = "${STAGING_BINDIR}/llvm-config"
+YOCTO_ALTERNATE_LIBDIR:toolchain-clang:class-target = "${base_libdir}"
+
+#YOCTO_ALTERNATE_EXE_PATH:toolchain-clang:class-target[export] = "1"
+#YOCTO_ALTERNATE_LIBDIR:toolchain-clang:class-target[export] = "1"
+
 #DEPENDS:append:toolchain-clang:class-target = " clang-cross-${TARGET_ARCH} "
 #DEPENDS:remove:toolchain-clang:allarch = "clang-cross-${TARGET_ARCH}"
 
 def clang_base_deps(d):
     if not d.getVar('INHIBIT_DEFAULT_DEPS', False):
         if not oe.utils.inherits(d, 'allarch') :
-            ret = " clang-cross-${TARGET_ARCH} virtual/libc "
+            ret = " ${MLPREFIX}clang-cross-${TARGET_ARCH} virtual/libc "
             if (d.getVar('RUNTIME').find('android') != -1):
                 ret += " libcxx"
                 return ret
             if (d.getVar('RUNTIME').find('llvm') != -1):
-                ret += " compiler-rt libcxx"
+                ret += " compiler-rt"
             elif (d.getVar('COMPILER_RT').find('-rtlib=compiler-rt') != -1):
                 ret += " compiler-rt "
             else:
@@ -128,7 +133,7 @@ BASE_DEFAULT_DEPS:append:class-native:toolchain-clang:runtime-llvm = " libcxx-na
 BASE_DEFAULT_DEPS:append:class-nativesdk:toolchain-clang:runtime-llvm = " clang-native nativesdk-libcxx nativesdk-compiler-rt"
 
 # do_populate_sysroot needs STRIP
-POPULATESYSROOTDEPS:toolchain-clang:class-target = "clang-cross-${TARGET_ARCH}:do_populate_sysroot"
+POPULATESYSROOTDEPS:toolchain-clang:class-target = "${MLPREFIX}clang-cross-${TARGET_ARCH}:do_populate_sysroot"
 
 cmake_do_generate_toolchain_file:append:toolchain-clang () {
     cat >> ${WORKDIR}/toolchain.cmake <<EOF
