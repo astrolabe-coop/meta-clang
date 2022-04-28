@@ -11,6 +11,9 @@ This patch adds support for the Xtensa CPU architecture to LLD.
 It is taken from an upstream merge request at
 https://github.com/espressif/llvm-project/pull/53
 
+Modifications by bero outside of espressif's tree:
+- Make it compile with newer LLVM 14.0.x releases
+
 Upstream-Status: Submitted [https://github.com/espressif/llvm-project/pull/53]
 Signed-off-by: Bernhard Rosenkränzer <bernhard.rosenkraenzer.ext@huawei.com>
 
@@ -64,7 +67,7 @@ index 0000000000000..b122fb590e11e
 +
 +} // namespace
 +
-+Xtensa::Xtensa() { noneRel = R_XTENSA_NONE; }
++Xtensa::Xtensa() { }
 +
 +RelExpr Xtensa::getRelExpr(RelType type, const Symbol &s,
 +                           const uint8_t *loc) const {
