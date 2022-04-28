@@ -1,0 +1,246 @@
+# SPDX-FileCopyrightText: LLVM Project
+#
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+From 9574ba458bf64680fd13a85e41c52ba8a7120512 Mon Sep 17 00:00:00 2001
+From: Ayke van Laethem <aykevanlaethem@gmail.com>
+Date: Tue, 15 Feb 2022 22:28:08 +0100
+Subject: [PATCH] [Xtensa] Add LLD linker support
+
+This patch adds support for the Xtensa CPU architecture to LLD.
+It is taken from an upstream merge request at
+https://github.com/espressif/llvm-project/pull/53
+
+Upstream-Status: Submitted [https://github.com/espressif/llvm-project/pull/53]
+Signed-off-by: Bernhard Rosenkränzer <bernhard.rosenkraenzer.ext@huawei.com>
+
+---
+ lld/ELF/Arch/Xtensa.cpp     | 125 ++++++++++++++++++++++++++++++++++++
+ lld/ELF/CMakeLists.txt      |   1 +
+ lld/ELF/InputFiles.cpp      |   2 +
+ lld/ELF/Target.cpp          |   2 +
+ lld/ELF/Target.h            |   1 +
+ lld/test/ELF/xtensa-reloc.s |  17 +++++
+ lld/test/lit.cfg.py         |   3 +-
+ 7 files changed, 150 insertions(+), 1 deletion(-)
+ create mode 100644 lld/ELF/Arch/Xtensa.cpp
+ create mode 100644 lld/test/ELF/xtensa-reloc.s
+
+diff --git a/lld/ELF/Arch/Xtensa.cpp b/lld/ELF/Arch/Xtensa.cpp
+new file mode 100644
+index 0000000000000..b122fb590e11e
+--- /dev/null
++++ b/lld/ELF/Arch/Xtensa.cpp
+@@ -0,0 +1,125 @@
++//===- Xtensa.cpp ---------------------------------------------------------===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#include "InputFiles.h"
++#include "Symbols.h"
++#include "Target.h"
++
++using namespace llvm;
++using namespace llvm::object;
++using namespace llvm::support::endian;
++using namespace llvm::ELF;
++using namespace lld;
++using namespace lld::elf;
++
++namespace {
++
++class Xtensa final : public TargetInfo {
++public:
++  Xtensa();
++  RelExpr getRelExpr(RelType type, const Symbol &s,
++                     const uint8_t *loc) const override;
++  void relocate(uint8_t *loc, const Relocation &rel,
++                uint64_t val) const override;
++};
++
++} // namespace
++
++Xtensa::Xtensa() { noneRel = R_XTENSA_NONE; }
++
++RelExpr Xtensa::getRelExpr(RelType type, const Symbol &s,
++                           const uint8_t *loc) const {
++  switch (type) {
++  case R_XTENSA_32:
++    return R_ABS;
++  case R_XTENSA_SLOT0_OP:
++    // This relocation is used for various instructions, with varying ways to
++    // calculate the relocation value. This is unlike most ELF architectures,
++    // and is arguably bad design (see the comment on R_386_GOT32 in X86.cpp).
++    // But that's what compilers emit, so it needs to be supported.
++    //
++    // We work around this by returning R_PC here and calculating the PC address
++    // in Xtensa::relocate based on the relative value. That's ugly. A better
++    // solution would be to look at the instruction here and emit various
++    // Xtensa-specific RelTypes, but that has another problem: the RelExpr enum
++    // is at its maximum size of 64. This will need to be fixed eventually, but
++    // for now hack around it and return R_PC.
++    return R_PC;
++  case R_XTENSA_ASM_EXPAND:
++    // This relocation appears to be emitted by the GNU Xtensa compiler as a
++    // linker relaxation hint. For example, for the following code:
++    //
++    //   .section .foo
++    //   .align  4
++    //   foo:
++    //       nop
++    //       nop
++    //       call0 bar
++    //   .align  4
++    //       bar:
++    //
++    // The call0 instruction is compiled to a l32r and callx0 instruction.
++    // The LLVM Xtensa backend does not emit this relocation.
++    // Because it's a relaxation hint, this relocation can be ignored for now
++    // until linker relaxations are implemented.
++    return R_NONE;
++  default:
++    error(getErrorLocation(loc) + "unknown relocation (" + Twine(type) +
++          ") against symbol " + toString(s));
++    return R_NONE;
++  }
++}
++
++void Xtensa::relocate(uint8_t *loc, const Relocation &rel, uint64_t val) const {
++  switch (rel.type) {
++  case R_XTENSA_32:
++    write32le(loc, val);
++    break;
++  case R_XTENSA_SLOT0_OP: {
++    // HACK: calculate the instruction location based on the PC-relative
++    // relocation value.
++    uint64_t dest = rel.sym->getVA(rel.addend);
++    uint64_t p = dest - val;
++
++    // This relocation is used for various instructions.
++    // Look at the instruction to determine how to do the relocation.
++    uint8_t opcode = loc[0] & 0x0f;
++    if (opcode == 0b0001) { // l32r
++      uint64_t val = dest - ((p + 3) & (uint64_t)0xfffffffc);
++      checkInt(loc, static_cast<int64_t>(val) >> 2, 16, rel);
++      checkAlignment(loc, val, 4, rel);
++      write16le(loc + 1, static_cast<int64_t>(val) >> 2);
++    } else if (opcode == 0b0101) { // call0, call4, call8, call12
++      uint64_t val = dest - ((p + 4) & (uint64_t)0xfffffffc);
++      checkInt(loc, static_cast<int64_t>(val) >> 2, 18, rel);
++      checkAlignment(loc, val, 4, rel);
++      const int64_t target = static_cast<int64_t>(val) >> 2;
++      loc[0] = (loc[0] & 0b0011'1111) | ((target & 0b0000'0011) << 6);
++      loc[1] = target >> 2;
++      loc[2] = target >> 10;
++    } else if ((loc[0] & 0x3f) == 0b00'0110) { // j
++      uint64_t val = dest - p + 4;
++      checkInt(loc, static_cast<int64_t>(val), 18, rel);
++      loc[0] = (loc[0] & 0b0011'1111) | ((val & 0b0000'0011) << 6);
++      loc[1] = val >> 2;
++      loc[2] = val >> 10;
++    } else {
++      error(getErrorLocation(loc) +
++            "unknown opcode for relocation: " + std::to_string(opcode));
++    }
++    break;
++  }
++  default:
++    llvm_unreachable("unknown relocation");
++  }
++}
++
++TargetInfo *elf::getXtensaTargetInfo() {
++  static Xtensa target;
++  return &target;
++}
+diff --git a/lld/ELF/CMakeLists.txt b/lld/ELF/CMakeLists.txt
+index f85d0fb9f55e3..58076511c1b98 100644
+--- a/lld/ELF/CMakeLists.txt
++++ b/lld/ELF/CMakeLists.txt
+@@ -18,6 +18,7 @@ add_lld_library(lldELF
+   Arch/SPARCV9.cpp
+   Arch/X86.cpp
+   Arch/X86_64.cpp
++  Arch/Xtensa.cpp
+   ARMErrataFix.cpp
+   CallGraphSort.cpp
+   DWARF.cpp
+diff --git a/lld/ELF/InputFiles.cpp b/lld/ELF/InputFiles.cpp
+index d5b9efbe18fc5..a4cb398622517 100644
+--- a/lld/ELF/InputFiles.cpp
++++ b/lld/ELF/InputFiles.cpp
+@@ -1649,6 +1649,8 @@ static uint16_t getBitcodeMachineKind(StringRef path, const Triple &t) {
+     return t.isOSIAMCU() ? EM_IAMCU : EM_386;
+   case Triple::x86_64:
+     return EM_X86_64;
++  case Triple::xtensa:
++    return EM_XTENSA;
+   default:
+     error(path + ": could not infer e_machine from bitcode target triple " +
+           t.str());
+diff --git a/lld/ELF/Target.cpp b/lld/ELF/Target.cpp
+index d3e54f7387d7d..043fc10a863b5 100644
+--- a/lld/ELF/Target.cpp
++++ b/lld/ELF/Target.cpp
+@@ -87,6 +87,8 @@ TargetInfo *elf::getTarget() {
+     return getSPARCV9TargetInfo();
+   case EM_X86_64:
+     return getX86_64TargetInfo();
++  case EM_XTENSA:
++    return getXtensaTargetInfo();
+   }
+   llvm_unreachable("unknown target machine");
+ }
+diff --git a/lld/ELF/Target.h b/lld/ELF/Target.h
+index 1fe3217c6d1dc..88e69a8f65778 100644
+--- a/lld/ELF/Target.h
++++ b/lld/ELF/Target.h
+@@ -183,6 +183,7 @@ TargetInfo *getRISCVTargetInfo();
+ TargetInfo *getSPARCV9TargetInfo();
+ TargetInfo *getX86TargetInfo();
+ TargetInfo *getX86_64TargetInfo();
++TargetInfo *getXtensaTargetInfo();
+ template <class ELFT> TargetInfo *getMipsTargetInfo();
+ 
+ struct ErrorPlace {
+diff --git a/lld/test/ELF/xtensa-reloc.s b/lld/test/ELF/xtensa-reloc.s
+new file mode 100644
+index 0000000000000..7007756aa2a89
+--- /dev/null
++++ b/lld/test/ELF/xtensa-reloc.s
+@@ -0,0 +1,17 @@
++# REQUIRES: xtensa
++# RUN: llvm-mc -filetype=obj -triple=xtensa -mcpu=esp32 %s -o %t.o
++# RUN: ld.lld %t.o --defsym=a=0x2000 --section-start=.CALL=0x1000 --defsym=b=40 -o %t
++# RUN: llvm-objdump -d --print-imm-hex %t | FileCheck %s
++
++.section .CALL,"ax",@progbits
++# CHECK-LABEL: section .CALL:
++# CHECK:      call0 . +4096
++# CHECK-NEXT: call0 . +4096
++# CHECK-NEXT: call0 . +4092
++# CHECK-NEXT: call0 . +4088
++# CHECK-NEXT: call0 . -4068
++  call0 a
++  call0 a
++  call0 a
++  call0 a
++  call0 b
+diff --git a/lld/test/lit.cfg.py b/lld/test/lit.cfg.py
+index 225104243bf26..654450e018f04 100644
+--- a/lld/test/lit.cfg.py
++++ b/lld/test/lit.cfg.py
+@@ -76,7 +76,8 @@
+                           'RISCV': 'riscv',
+                           'Sparc': 'sparc',
+                           'WebAssembly': 'wasm',
+-                          'X86': 'x86'})
++                          'X86': 'x86',
++                          'Xtensa': 'xtensa'})
+      ])
+ 
+ # Set a fake constant version so that we get consistent output.
